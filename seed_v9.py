@@ -4,16 +4,18 @@ The script rebuilds the demo dataset from scratch (users, address books, categor
 products, shopping carts and order history) so it is safe to re-run whenever you want
 a fresh, rich sample database.
 
-Passwords for the regular demo users are read from .streamlit/secrets.toml
-under the [demo_users] table; admin credentials are handled by v9.init_db().
+Passwords for the regular demo users are read from Streamlit secrets under
+the [demo_users] table (locally: .streamlit/secrets.toml, on Streamlit Cloud:
+the app's Secrets settings). Admin credentials are handled by v9.init_db().
 
 Run with:  python seed_v9.py
 """
 
 import json
-import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import streamlit as st
 
 import v9
 
@@ -24,6 +26,19 @@ NEUTRAL = v9.GENDER_NEUTRAL_LABEL
 
 # --------------------------------------------------------------------------- helpers
 def load_demo_passwords():
+    """Read demo passwords from Streamlit secrets (Cloud or local .streamlit/secrets.toml)."""
+    try:
+        demo_users = st.secrets.get("demo_users", {})
+        if demo_users:
+            return dict(demo_users)
+    except Exception:
+        pass
+
+    # Fallback for running the seeder outside Streamlit on Python 3.11+.
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10 and older
+        import tomli as tomllib
     with SECRETS_PATH.open("rb") as handle:
         secrets = tomllib.load(handle)
     return dict(secrets.get("demo_users", {}))
