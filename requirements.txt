@@ -1,0 +1,23 @@
+# Runtime requirements for v9.py
+#
+# v9.py uses st.dataframe(width="stretch", ...) and widget `placeholder=` arguments,
+# which require Streamlit 1.50+. The transformer NLI model is the only non-stdlib
+# dependency of the app itself; Pillow is used by the sample-image generators.
+
+streamlit>=1.50.0
+transformers>=4.45,<6
+torch>=2.2
+huggingface-hub>=0.24
+tokenizers>=0.15
+safetensors>=0.4
+
+# Data/plotting stack pulled in by Streamlit (pinned with lower bounds for reproducibility)
+pandas>=2.0
+numpy>=1.24
+altair>=5.0
+
+# Product illustration generators + st.image rendering
+pillow>=10
+
+# Tokenizer backend kept for compatibility with a range of HF models
+sentencepiece>=0.2
