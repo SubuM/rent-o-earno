@@ -1,8 +1,9 @@
 import streamlit as st
 import sqlite3
 import hashlib
+import secrets
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 
 try:
@@ -17,6 +18,7 @@ DB_NAME = "rental_app.db"
 UPLOAD_DIR = "uploads"
 MODEL_DIR = os.path.join("models", "gender-nli")
 DEFAULT_MODEL_ID = "MoritzLaurer/xtremedistil-l6-h256-mnli-fever-anli-ling-binary"
+SESSION_TTL_DAYS = 7
 
 GENDER_OPTIONS = ["Women's", "Men's", "Kids", "Unisex"]
 GENDER_NEUTRAL_LABEL = "Gender Neutral"
@@ -100,6 +102,16 @@ def init_db():
         address TEXT,
         phone TEXT,
         is_admin BOOLEAN DEFAULT 0
+    )''')
+
+    # Persistent Browser Sessions table (survives browser reloads)
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        active_page TEXT DEFAULT 'Borrower Portal',
+        created_at DATETIME,
+        expires_at DATETIME,
+        FOREIGN KEY(user_id) REFERENCES users(id)
     )''')
 
     # User Address Book table
@@ -375,7 +387,7 @@ def classify_product_gender(category, title, description):
         ) from exc
 
 
-# --- Authentication & Navigation Helpers ---
+# --- Authentication, Persistent Session & Navigation Helpers ---
 def hash_pw(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -388,6 +400,86 @@ def login_user(username, password):
     ).fetchone()
     conn.close()
     return user
+
+
+def create_user_session(user_id, active_page="Borrower Portal"):
+    """Create a persistent DB-backed login session token for browser reload survival."""
+    conn = get_db()
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_str = (now + timedelta(days=SESSION_TTL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    token = secrets.token_urlsafe(32)
+
+    # Prune expired sessions opportunistically
+    conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_str,))
+    conn.execute(
+        """
+        INSERT INTO sessions (token, user_id, active_page, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (token, user_id, active_page, now_str, expires_str),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_user_by_session_token(token):
+    """Validate a persistent session token and return (user_dict, saved_active_page)."""
+    if not token or not isinstance(token, str):
+        return None, "Borrower Portal"
+
+    conn = get_db()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = conn.execute(
+        """
+        SELECT s.active_page AS session_active_page,
+               s.expires_at AS session_expires_at,
+               u.*
+        FROM sessions s
+        JOIN users u ON s.user_id = u.id
+        WHERE s.token = ?
+        """,
+        (token,),
+    ).fetchone()
+
+    if row is None:
+        conn.close()
+        return None, "Borrower Portal"
+
+    if row["session_expires_at"] and row["session_expires_at"] <= now_str:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None, "Borrower Portal"
+
+    saved_page = row["session_active_page"] or "Borrower Portal"
+    user_dict = {k: row[k] for k in row.keys() if not k.startswith("session_")}
+    conn.close()
+    return user_dict, saved_page
+
+
+def update_session_page(token, page_name):
+    """Persist the user's current portal view so browser refresh stays on the same page."""
+    if not token or not page_name:
+        return
+    conn = get_db()
+    conn.execute(
+        "UPDATE sessions SET active_page = ? WHERE token = ?",
+        (page_name, token),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_user_session(token):
+    """Revoke a session token on explicit logout."""
+    if not token:
+        return
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
 
 
 def is_lender(user_id):
@@ -403,6 +495,7 @@ def navigate_to_page(page_name):
     """Callback to safely update navigation state before widgets instantiate."""
     st.session_state["nav_radio"] = page_name
     st.session_state["active_page"] = page_name
+    update_session_page(st.session_state.get("session_token"), page_name)
 
 
 def redirect_to_address_book(return_page=None):
@@ -411,6 +504,7 @@ def redirect_to_address_book(return_page=None):
     if return_page:
         st.session_state["return_after_address"] = return_page
     st.session_state["pending_nav_target"] = "Address Book"
+    update_session_page(st.session_state.get("session_token"), "Address Book")
     st.rerun()
 
 
@@ -973,26 +1067,33 @@ def auth_view():
 
     with tab1:
         st.subheader("Login")
-        username = st.text_input(
-            "Username :red[*]",
-            placeholder="e.g., choose_a_username",
-            key="login_user",
-        )
-        password = st.text_input(
-            "Password :red[*]",
-            type="password",
-            placeholder="Enter your account password",
-            key="login_pw",
-        )
-        st.caption(MANDATORY_FIELD_LEGEND)
-        if st.button("Login"):
+        with st.form("login_form"):
+            username = st.text_input(
+                "Username :red[*]",
+                placeholder="e.g., choose_a_username",
+                key="login_user",
+            )
+            password = st.text_input(
+                "Password :red[*]",
+                type="password",
+                placeholder="Enter your account password",
+                key="login_pw",
+            )
+            st.caption(MANDATORY_FIELD_LEGEND)
+            submitted = st.form_submit_button("Login", type="primary")
+
+        if submitted:
             if not username.strip() or not password.strip():
                 st.error("Username and password are required.")
             else:
-                user = login_user(username, password)
+                user = login_user(username.strip(), password)
                 if user:
-                    st.session_state["user"] = dict(user)
+                    user_dict = dict(user)
+                    token = create_user_session(user_dict["id"], "Borrower Portal")
+                    st.session_state["user"] = user_dict
+                    st.session_state["session_token"] = token
                     st.session_state["active_page"] = "Borrower Portal"
+                    st.query_params["session"] = token
                     st.success("Logged in successfully!")
                     st.rerun()
                 else:
@@ -1823,6 +1924,7 @@ def address_book_portal():
         ):
             target = st.session_state.pop("return_after_address")
             conn.close()
+            update_session_page(st.session_state.get("session_token"), target)
             st.session_state["pending_nav_target"] = target
             st.rerun()
     else:
@@ -2235,7 +2337,9 @@ def order_history_portal():
 
 
 def _on_nav_radio_change():
-    st.session_state["active_page"] = st.session_state["nav_radio"]
+    new_page = st.session_state["nav_radio"]
+    st.session_state["active_page"] = new_page
+    update_session_page(st.session_state.get("session_token"), new_page)
 
 
 # --- Main App Routing ---
@@ -2246,14 +2350,38 @@ def main():
     if st.session_state.get("toast_msg"):
         st.toast(st.session_state.pop("toast_msg"))
 
+    # Restore authenticated session across browser refreshes via URL session token
+    if "user" not in st.session_state:
+        url_token = st.query_params.get("session")
+        if isinstance(url_token, list):
+            url_token = url_token[0] if url_token else None
+        if url_token:
+            restored_user, saved_page = get_user_by_session_token(url_token)
+            if restored_user:
+                st.session_state["user"] = restored_user
+                st.session_state["session_token"] = url_token
+                st.session_state["active_page"] = saved_page
+                st.session_state["nav_radio"] = saved_page
+            else:
+                st.query_params.pop("session", None)
+
     if "user" not in st.session_state:
         auth_view()
     else:
         user = st.session_state["user"]
         is_admin = bool(user["is_admin"])
+
+        # Keep query parameter synchronized on subsequent widget reruns
+        session_token = st.session_state.get("session_token")
+        if session_token and st.query_params.get("session") != session_token:
+            st.query_params["session"] = session_token
+
         st.sidebar.write(f"Welcome, **{user['username']}**")
         if st.sidebar.button("Logout"):
+            delete_user_session(session_token)
+            st.query_params.pop("session", None)
             del st.session_state["user"]
+            st.session_state.pop("session_token", None)
             st.session_state.pop("active_page", None)
             st.session_state.pop("nav_radio", None)
             st.session_state.pop("pending_nav_target", None)
@@ -2282,6 +2410,7 @@ def main():
             if target in options:
                 st.session_state["active_page"] = target
                 st.session_state["nav_radio"] = target
+                update_session_page(session_token, target)
 
         if (
             "active_page" not in st.session_state
